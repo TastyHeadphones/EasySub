@@ -1,0 +1,31 @@
+{
+  "name": "easysub",
+  "version": "1.0.0",
+  "description": "EasySub: subscription manager on Cloudflare Workers",
+  "main": "index.js",
+  "scripts": {
+    "build:web": "cd web && npm ci && npm run build",
+    "dev:worker": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TastyHeadphones/EasySub.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/TastyHeadphones/EasySub/issues"
+  },
+  "homepage": "https://github.com/TastyHeadphones/EasySub#readme",
+  "dependencies": {
+    "cbor-x": "^1.5.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "typescript": "^5.4.5",
+    "wrangler": "^3.78.8"
+  }
+}

@@ -1,0 +1,6 @@
+node_modules
+web/node_modules
+web/dist
+.dist
+wrangler-state.json
+.DS_Store

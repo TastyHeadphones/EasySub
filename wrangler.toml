@@ -1,0 +1,36 @@
+name = "easysub"
+main = "worker/src/index.ts"
+compatibility_date = "2025-01-15"
+
+[build]
+command = "npm ci && npm run build:web"
+
+[assets]
+directory = "web/dist"
+binding = "ASSETS"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[durable_objects]
+bindings = [
+  { name = "DO_ADMIN", class_name = "AdminStore" },
+  { name = "DO_CREDS", class_name = "CredentialStore" },
+  { name = "DO_CHALLENGES", class_name = "ChallengeStore" },
+  { name = "DO_SESSIONS", class_name = "SessionStore" },
+  { name = "DO_SUBS", class_name = "SubscriptionStore" },
+  { name = "DO_LINKS", class_name = "LinkStore" },
+  { name = "DO_OUTBOX", class_name = "OutboxStore" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = [
+  "AdminStore",
+  "CredentialStore",
+  "ChallengeStore",
+  "SessionStore",
+  "SubscriptionStore",
+  "LinkStore",
+  "OutboxStore"
+]
