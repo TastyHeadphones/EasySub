@@ -7,12 +7,12 @@ export function toBase64Url(data: ArrayBuffer | Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-export function fromBase64Url(value: string): Uint8Array<ArrayBuffer> {
+export function fromBase64Url(value: string): Uint8Array {
   const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
   const pad = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
   const binary = atob(normalized + pad);
   const buffer = new ArrayBuffer(binary.length);
-  const bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
+  const bytes = new Uint8Array(buffer);
   for (let i = 0; i < binary.length; i += 1) {
     bytes[i] = binary.charCodeAt(i);
   }

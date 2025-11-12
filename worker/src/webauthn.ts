@@ -198,6 +198,90 @@ function concatBuffers(a: ArrayBuffer, b: ArrayBuffer): ArrayBuffer {
   return buffer.buffer;
 }
 
+function trimLeadingZeros(source: Uint8Array): Uint8Array {
+  let start = 0;
+  while (start < source.length - 1 && source[start] === 0) {
+    start += 1;
+  }
+  const slice = source.subarray(start);
+  const copy = new Uint8Array(slice.length);
+  copy.set(slice);
+  return copy;
+}
+
+function ensurePositiveInteger(bytes: Uint8Array) {
+  if (bytes[0] & 0x80) {
+    const next = new Uint8Array(bytes.length + 1);
+    next[0] = 0;
+    next.set(bytes, 1);
+    return next;
+  }
+  return bytes;
+}
+
+function rawSignatureToDer(raw: Uint8Array): Uint8Array {
+  if (raw.length % 2 !== 0) {
+    throw new Error('Invalid raw ECDSA signature length');
+  }
+  const half = raw.length / 2;
+  let r = trimLeadingZeros(raw.slice(0, half));
+  let s = trimLeadingZeros(raw.slice(half));
+  r = ensurePositiveInteger(r);
+  s = ensurePositiveInteger(s);
+  const totalLength = 2 + r.length + 2 + s.length;
+  const der = new Uint8Array(2 + totalLength);
+  der[0] = 0x30;
+  der[1] = totalLength;
+  der[2] = 0x02;
+  der[3] = r.length;
+  der.set(r, 4);
+  const sOffset = 4 + r.length;
+  der[sOffset] = 0x02;
+  der[sOffset + 1] = s.length;
+  der.set(s, sOffset + 2);
+  return der;
+}
+
+function derSignatureToRaw(der: Uint8Array, size = 32): Uint8Array | null {
+  if (der.length < 8 || der[0] !== 0x30) {
+    return null;
+  }
+  let offset = 2;
+  let length = der[1];
+  if (length & 0x80) {
+    const lengthBytes = length & 0x7f;
+    if (lengthBytes > 2 || der.length < 2 + lengthBytes) {
+      return null;
+    }
+    length = 0;
+    for (let i = 0; i < lengthBytes; i += 1) {
+      length = (length << 8) | der[offset + i];
+    }
+    offset += lengthBytes;
+  }
+  if (der[offset] !== 0x02) {
+    return null;
+  }
+  const lenR = der[offset + 1];
+  const rStart = offset + 2;
+  const rEnd = rStart + lenR;
+  const r = der.slice(rStart, rEnd);
+  offset = rEnd;
+  if (der[offset] !== 0x02) {
+    return null;
+  }
+  const lenS = der[offset + 1];
+  const sStart = offset + 2;
+  const sEnd = sStart + lenS;
+  const s = der.slice(sStart, sEnd);
+  const raw = new Uint8Array(size * 2);
+  const rTrimmed = trimLeadingZeros(r);
+  const sTrimmed = trimLeadingZeros(s);
+  raw.set(rTrimmed.slice(Math.max(0, rTrimmed.length - size)), size - Math.min(size, rTrimmed.length));
+  raw.set(sTrimmed.slice(Math.max(0, sTrimmed.length - size)), raw.length - Math.min(size, sTrimmed.length));
+  return raw;
+}
+
 export async function verifyAssertion(input: AssertionVerificationInput): Promise<AssertionVerificationResult> {
   const { credential } = input;
   if (credential.type !== 'public-key') {
@@ -224,13 +308,26 @@ export async function verifyAssertion(input: AssertionVerificationInput): Promis
   const clientHash = await sha256(clientDataBytes);
   const authDataBuffer = cloneToArrayBuffer(authenticatorData);
   const signedData = concatBuffers(authDataBuffer, clientHash);
-  const signatureBuffer = cloneToArrayBuffer(signature);
-  const verified = await crypto.subtle.verify(
-    { name: 'ECDSA', hash: 'SHA-256' },
-    publicKey,
-    signatureBuffer,
-    signedData,
-  );
+  const signedDataBuffer = cloneToArrayBuffer(signedData);
+
+  async function verifyWithSignature(bytes: Uint8Array) {
+    const buffer = cloneToArrayBuffer(bytes);
+    return crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, publicKey, buffer, signedDataBuffer);
+  }
+
+  let verified = await verifyWithSignature(signature);
+  if (!verified && signature.length === 64) {
+    verified = await verifyWithSignature(rawSignatureToDer(signature));
+  }
+  if (!verified) {
+    const raw = derSignatureToRaw(signature);
+    if (raw) {
+      verified = await verifyWithSignature(raw);
+      if (!verified && raw.length === 64) {
+        verified = await verifyWithSignature(rawSignatureToDer(raw));
+      }
+    }
+  }
   if (!verified) {
     throw new Error('Invalid assertion signature');
   }
