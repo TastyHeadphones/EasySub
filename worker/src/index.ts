@@ -143,7 +143,12 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       return json(result);
     }
     if (request.method === 'POST' && path === '/admin/login/start') {
-      const body = await request.json();
+      let body: any = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
       return json(await startLogin(body, request, env));
     }
     if (request.method === 'POST' && path === '/admin/login/finish') {
