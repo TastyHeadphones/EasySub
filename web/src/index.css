@@ -189,3 +189,32 @@ textarea {
 a {
   color: #2563eb;
 }
+
+.schedule {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.schedule__option {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.schedule__option + .schedule__option {
+  margin-top: 12px;
+}
+
+.schedule__option label {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.schedule__option input[type='number'],
+.schedule__option input[type='datetime-local'] {
+  max-width: 200px;
+}

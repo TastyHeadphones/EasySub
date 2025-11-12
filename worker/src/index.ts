@@ -43,23 +43,19 @@ interface SessionRecord {
 interface SubscriptionRecord {
   id: string;
   name: string;
-  subscriberEmail: string;
-  amountCents: number;
-  currency: string;
-  intervalDays: number;
+  linkUrl: string;
+  intervalDays?: number;
+  invokeAt?: number;
   createdAt: number;
   expiresAt: number;
-  notes?: string;
   status: 'active' | 'expired';
 }
 
 interface SubscriptionInput {
   name: string;
-  subscriberEmail: string;
-  amountCents: number;
-  currency: string;
-  intervalDays: number;
-  notes?: string;
+  linkUrl: string;
+  intervalDays?: number;
+  invokeAt?: number;
   expiresAt: number;
 }
 
@@ -177,7 +173,6 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       const payload = await request.json();
       const normalized = prepareSubscriptionPayload(payload);
       const created = await subsRequest<SubscriptionRecord>(env, 'create', normalized);
-      await notifySubscription(created, env);
       return json(created, undefined, 201);
     }
     if (request.method === 'DELETE' && path.startsWith('/subscriptions/')) {
@@ -360,41 +355,58 @@ function getSessionToken(request: Request) {
   return match ? match[1] : null;
 }
 
-async function notifySubscription(subscription: SubscriptionRecord, env: Env) {
-  const message: OutboxMessage = {
-    id: crypto.randomUUID(),
-    to: subscription.subscriberEmail,
-    subject: `Subscription created: ${subscription.name}`,
-    body: `You subscribed to ${subscription.name} for ${(subscription.amountCents / 100).toFixed(2)} ${
-      subscription.currency
-    }`,
-    createdAt: Date.now(),
-    status: 'pending',
-  };
-  await outboxRequest<OutboxMessage>(env, 'enqueue', { message });
-}
-
 function prepareSubscriptionPayload(body: any): SubscriptionInput {
   const name = String(body?.name ?? '').trim();
-  const subscriberEmail = String(body?.subscriberEmail ?? '').trim().toLowerCase();
-  const rawAmount = body?.amountCents ?? body?.amount ?? 0;
-  const amountCents = Math.round(Number(rawAmount));
-  const currency = String(body?.currency ?? 'USD').trim().toUpperCase();
-  const intervalDays = Math.max(1, Number(body?.intervalDays ?? 30));
-  const notes = body?.notes ? String(body.notes).slice(0, 500) : undefined;
-  if (!name || !subscriberEmail || !Number.isFinite(amountCents) || amountCents <= 0) {
-    throw new Error('Invalid subscription payload');
+  const rawLink = String(body?.linkUrl ?? '').trim();
+  if (!name || !rawLink) {
+    throw new Error('Name and link are required');
   }
-  const expiresAt = body?.expiresAt
-    ? Number(body.expiresAt)
-    : Date.now() + intervalDays * 24 * 60 * 60 * 1000;
+  let linkUrl: string;
+  try {
+    const parsed = new URL(rawLink);
+    linkUrl = parsed.toString();
+  } catch {
+    throw new Error('Link must be a valid URL');
+  }
+  const intervalDaysValue = body?.intervalDays;
+  const hasInterval = intervalDaysValue !== undefined && intervalDaysValue !== null && intervalDaysValue !== '';
+  let intervalDays: number | undefined;
+  if (hasInterval) {
+    const parsedInterval = Number(intervalDaysValue);
+    if (!Number.isFinite(parsedInterval) || parsedInterval <= 0) {
+      throw new Error('Interval days must be a positive number');
+    }
+    intervalDays = Math.round(parsedInterval);
+  }
+  if (hasInterval && intervalDays === undefined) {
+    throw new Error('Interval days must be a positive number');
+  }
+  const invokeInput = body?.invokeAt ?? body?.invokeDate;
+  let invokeAt: number | undefined;
+  if (invokeInput) {
+    const parsed = new Date(invokeInput);
+    const timestamp = parsed.getTime();
+    if (Number.isNaN(timestamp)) {
+      throw new Error('Invoke date is invalid');
+    }
+    invokeAt = timestamp;
+  }
+  let expiresAt: number | undefined;
+  if (typeof body?.expiresAt === 'number') {
+    expiresAt = body.expiresAt;
+  } else if (invokeAt) {
+    expiresAt = invokeAt;
+  } else if (intervalDays) {
+    expiresAt = Date.now() + intervalDays * 24 * 60 * 60 * 1000;
+  }
+  if (!expiresAt) {
+    throw new Error('Provide either interval days or an invoke date');
+  }
   return {
     name,
-    subscriberEmail,
-    amountCents,
-    currency,
-    intervalDays,
-    notes,
+    linkUrl,
+    intervalDays: intervalDays ?? undefined,
+    invokeAt,
     expiresAt,
   };
 }
@@ -459,31 +471,76 @@ async function handlePublicLink(request: Request, env: Env) {
   if (!subscription) {
     return new Response('Subscription missing', { status: 404 });
   }
+  let fetchedText = '';
+  let fetchError = '';
+  try {
+    const response = await fetch(subscription.linkUrl, { method: 'GET' });
+    if (!response.ok) {
+      throw new Error(`Remote link returned ${response.status}`);
+    }
+    const text = await response.text();
+    fetchedText = text.slice(0, 5000);
+  } catch (error) {
+    fetchError = `Unable to load linked content: ${
+      error instanceof Error ? error.message : 'Unknown error'
+    }`;
+  }
+  const scheduleParts: string[] = [];
+  if (subscription.intervalDays) {
+    scheduleParts.push(`Interval: every ${subscription.intervalDays} day${subscription.intervalDays === 1 ? '' : 's'}`);
+  }
+  if (subscription.invokeAt) {
+    scheduleParts.push(`Invokes on ${new Date(subscription.invokeAt).toLocaleString('en-US')}`);
+  }
+  scheduleParts.push(`Valid until ${new Date(subscription.expiresAt).toLocaleString('en-US')}`);
+  const safeName = escapeHtml(subscription.name);
+  const safeLink = escapeHtml(subscription.linkUrl);
+  const safeBody = escapeHtml(fetchedText || fetchError || 'No content available');
+  const metaHtml = scheduleParts.map((line) => `<p class="meta">${escapeHtml(line)}</p>`).join('');
   const html = `<!doctype html>
   <html>
     <head>
       <meta charset="utf-8" />
-      <title>${subscription.name} · EasySub</title>
+      <title>${safeName} · EasySub</title>
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <style>
         body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 32px; background: #f6f6f9; }
-        .card { max-width: 480px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 32px; box-shadow: 0 10px 30px rgba(15,23,42,0.1); }
+        .card { max-width: 640px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 32px; box-shadow: 0 10px 30px rgba(15,23,42,0.1); }
         h1 { margin-top: 0; font-size: 1.8rem; }
-        .price { font-size: 1.5rem; font-weight: 600; color: #2563eb; }
         .meta { color: #475569; margin-top: 8px; }
+        pre { background: #f8fafc; padding: 16px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; }
+        a { color: #2563eb; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h1>${subscription.name}</h1>
-        <div class="price">${(subscription.amountCents / 100).toFixed(2)} ${subscription.currency}</div>
-        <p class="meta">Renews every ${subscription.intervalDays} days</p>
-        <p class="meta">Valid until ${new Date(subscription.expiresAt).toLocaleString('en-US')}</p>
-        <p>${subscription.notes ?? ''}</p>
+        <h1>${safeName}</h1>
+        <p class="meta"><a href="${safeLink}" target="_blank" rel="noreferrer">Source link</a></p>
+        ${metaHtml}
+        <pre>${safeBody}</pre>
       </div>
     </body>
   </html>`;
   return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      case "'":
+        return '&#39;';
+      default:
+        return char;
+    }
+  });
 }
 
 async function handleDevEmails(env: Env) {
@@ -838,13 +895,11 @@ export class SubscriptionStore extends BaseStore<SubscriptionState> implements D
       const record: SubscriptionRecord = {
         id,
         name: payload.name ?? '',
-        subscriberEmail: payload.subscriberEmail ?? '',
-        amountCents: payload.amountCents ?? 0,
-        currency: (payload.currency ?? 'USD').toUpperCase(),
-        intervalDays: payload.intervalDays ?? 30,
+        linkUrl: payload.linkUrl ?? '',
+        intervalDays: payload.intervalDays,
+        invokeAt: payload.invokeAt,
         createdAt: Date.now(),
-        expiresAt: payload.expiresAt ?? Date.now() + (payload.intervalDays ?? 30) * 24 * 60 * 60 * 1000,
-        notes: payload.notes,
+        expiresAt: payload.expiresAt ?? payload.invokeAt ?? Date.now(),
         status: 'active',
       };
       this.data.items[id] = record;

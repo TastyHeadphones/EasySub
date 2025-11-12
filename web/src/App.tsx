@@ -10,13 +10,11 @@ interface AdminStatus {
 interface SubscriptionRecord {
   id: string;
   name: string;
-  subscriberEmail: string;
-  amountCents: number;
-  currency: string;
-  intervalDays: number;
+  linkUrl: string;
+  intervalDays?: number;
+  invokeAt?: number;
   createdAt: number;
   expiresAt: number;
-  notes?: string;
   status: 'active' | 'expired';
 }
 
@@ -24,14 +22,17 @@ type Phase = 'loading' | 'register' | 'login' | 'dashboard';
 
 type ShareLookup = Record<string, string>;
 
+type ScheduleMode = 'interval' | 'invoke';
+
 const FORM_DEFAULT = {
   name: '',
-  email: '',
-  amount: '9.99',
-  currency: 'USD',
-  intervalDays: 30,
-  notes: '',
+  linkUrl: '',
+  intervalDays: '30',
+  scheduleMode: 'interval' as ScheduleMode,
+  invokeDate: '',
 };
+
+type FormState = typeof FORM_DEFAULT;
 
 const App = () => {
   const [phase, setPhase] = useState<Phase>('loading');
@@ -39,7 +40,7 @@ const App = () => {
   const [error, setError] = useState<string | null>(null);
   const [subs, setSubs] = useState<SubscriptionRecord[]>([]);
   const [shares, setShares] = useState<ShareLookup>({});
-  const [form, setForm] = useState({ ...FORM_DEFAULT });
+  const [form, setForm] = useState<FormState>({ ...FORM_DEFAULT });
   const passkeySupported = useMemo(() => typeof window !== 'undefined' && 'PublicKeyCredential' in window, []);
 
   useEffect(() => {
@@ -137,21 +138,32 @@ const App = () => {
     setBusy(true);
     setError(null);
     try {
-      const amountNumber = Number(form.amount);
-      const amountCents = Math.round(amountNumber * 100);
-      if (!Number.isFinite(amountCents) || amountCents <= 0) {
-        throw new Error('Enter a valid amount');
+      const payload: Record<string, unknown> = {
+        name: form.name.trim(),
+        linkUrl: form.linkUrl.trim(),
+      };
+      if (!payload.name || !payload.linkUrl) {
+        throw new Error('Name and link are required');
+      }
+      if (form.scheduleMode === 'interval') {
+        const days = Number(form.intervalDays);
+        if (!Number.isFinite(days) || days <= 0) {
+          throw new Error('Enter a valid interval');
+        }
+        payload.intervalDays = Math.round(days);
+      } else {
+        if (!form.invokeDate) {
+          throw new Error('Pick an invoke date');
+        }
+        const timestamp = new Date(form.invokeDate).getTime();
+        if (Number.isNaN(timestamp)) {
+          throw new Error('Invoke date is invalid');
+        }
+        payload.invokeAt = timestamp;
       }
       await apiFetch('/api/subscriptions', {
         method: 'POST',
-        body: JSON.stringify({
-          name: form.name,
-          subscriberEmail: form.email,
-          amountCents,
-          currency: form.currency,
-          intervalDays: Number(form.intervalDays),
-          notes: form.notes,
-        }),
+        body: JSON.stringify(payload),
       });
       setForm({ ...FORM_DEFAULT });
       await refreshSubs();
@@ -229,27 +241,59 @@ const App = () => {
               <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required />
             </label>
             <label>
-              Subscriber email
-              <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} required />
+              Source link
+              <input
+                type="url"
+                placeholder="https://example.com/content.txt"
+                value={form.linkUrl}
+                onChange={(e) => setForm({ ...form, linkUrl: e.target.value })}
+                required
+              />
             </label>
-            <div className="row">
-              <label>
-                Amount
-                <input type="number" min="0" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} required />
-              </label>
-              <label>
-                Currency
-                <input value={form.currency} onChange={(e) => setForm({ ...form, currency: e.target.value.toUpperCase() })} required />
-              </label>
+            <div className="schedule stack">
+              <span className="muted">Schedule</span>
+              <div className="schedule__option">
+                <label>
+                  <input
+                    type="radio"
+                    name="schedule"
+                    value="interval"
+                    checked={form.scheduleMode === 'interval'}
+                    onChange={() => setForm((prev) => ({ ...prev, scheduleMode: 'interval' }))}
+                  />
+                  <span>Interval (days)</span>
+                </label>
+                {form.scheduleMode === 'interval' && (
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.intervalDays}
+                    onChange={(e) => setForm({ ...form, intervalDays: e.target.value })}
+                    required
+                  />
+                )}
+              </div>
+              <div className="schedule__option">
+                <label>
+                  <input
+                    type="radio"
+                    name="schedule"
+                    value="invoke"
+                    checked={form.scheduleMode === 'invoke'}
+                    onChange={() => setForm((prev) => ({ ...prev, scheduleMode: 'invoke' }))}
+                  />
+                  <span>Invoke on date</span>
+                </label>
+                {form.scheduleMode === 'invoke' && (
+                  <input
+                    type="datetime-local"
+                    value={form.invokeDate}
+                    onChange={(e) => setForm({ ...form, invokeDate: e.target.value })}
+                    required
+                  />
+                )}
+              </div>
             </div>
-            <label>
-              Interval (days)
-              <input type="number" min="1" value={form.intervalDays} onChange={(e) => setForm({ ...form, intervalDays: Number(e.target.value) })} required />
-            </label>
-            <label>
-              Notes
-              <textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={3} />
-            </label>
             <button type="submit" disabled={busy}>Create subscription</button>
           </form>
           <div className="card">
@@ -262,9 +306,15 @@ const App = () => {
                     <div>
                       <h4>{sub.name}</h4>
                       <p className="muted">
-                        {(sub.amountCents / 100).toFixed(2)} {sub.currency} · every {sub.intervalDays} days
+                        {sub.invokeAt
+                          ? `Invokes on ${new Date(sub.invokeAt).toLocaleString()}`
+                          : sub.intervalDays
+                            ? `Interval: every ${sub.intervalDays} day${sub.intervalDays === 1 ? '' : 's'}`
+                            : 'Custom schedule'}
                       </p>
-                      <p className="muted">Subscriber: {sub.subscriberEmail}</p>
+                      <p className="muted">
+                        Link: <a href={sub.linkUrl} target="_blank" rel="noreferrer">{sub.linkUrl}</a>
+                      </p>
                       <p className="muted">Expires: {new Date(sub.expiresAt).toLocaleString()}</p>
                       {shares[sub.id] && (
                         <p className="share">Share link: <a href={shares[sub.id]} target="_blank" rel="noreferrer">{shares[sub.id]}</a></p>
