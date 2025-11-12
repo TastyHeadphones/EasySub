@@ -65,8 +65,7 @@ const App = () => {
     }
   };
 
-  const handleRegister = async (evt: FormEvent<HTMLFormElement>) => {
-    evt.preventDefault();
+  const handleRegister = async () => {
     if (!passkeySupported) {
       setError('Passkeys are not supported in this browser.');
       return;
@@ -74,15 +73,9 @@ const App = () => {
     setBusy(true);
     setError(null);
     try {
-      const formData = new FormData(evt.currentTarget);
-      const email = String(formData.get('email') ?? '').trim();
-      const displayName = String(formData.get('displayName') ?? '').trim();
-      if (!email || !displayName) {
-        throw new Error('Email and display name are required');
-      }
       const start = await apiFetch<{ challenge: string; publicKey: CreationOptionsJSON }>('/api/admin/register/start', {
         method: 'POST',
-        body: JSON.stringify({ email, displayName }),
+        body: JSON.stringify({}),
       });
       const options = inflateCreationOptions(start.publicKey);
       const credential = (await navigator.credentials.create({ publicKey: options })) as PublicKeyCredential | null;
@@ -192,18 +185,12 @@ const App = () => {
       return (
         <section className="panel">
           <h2>Register Passkey</h2>
-          <p className="muted">Create the first admin by registering a passkey-protected account.</p>
-          <form onSubmit={handleRegister} className="stack">
-            <label>
-              Email
-              <input type="email" name="email" required placeholder="admin@example.com" />
-            </label>
-            <label>
-              Display name
-              <input type="text" name="displayName" required placeholder="EasySub Admin" />
-            </label>
-            <button type="submit" disabled={busy}>Register Passkey</button>
-          </form>
+          <p className="muted">
+            One click creates the admin identity with an auto-generated email, then stores your passkey.
+          </p>
+          <button type="button" onClick={handleRegister} disabled={busy}>
+            Create Admin Passkey
+          </button>
         </section>
       );
     }

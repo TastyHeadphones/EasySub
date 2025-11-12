@@ -1,8 +1,8 @@
-import { decode, decodeMultiple } from 'cbor-x';
+import { Decoder } from 'cbor-x';
 import { fromBase64Url, toBase64Url } from './base64';
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const textDecoder = new TextDecoder();
 
 export interface RegistrationCredentialPayload {
   id: string;
@@ -84,13 +84,13 @@ function bufferEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 function parseClientData(clientDataJSON: string) {
   const bytes = fromBase64Url(clientDataJSON);
-  const json = decoder.decode(bytes);
+  const json = textDecoder.decode(bytes);
   return { payload: JSON.parse(json), bytes };
 }
 
 function parseAttestationObject(attestationObject: string) {
   const bytes = fromBase64Url(attestationObject);
-  const decoded = decode(bytes) as Map<string, unknown>;
+  const decoded = new Decoder({ mapsAsObjects: false }).decode(bytes) as Map<string, unknown>;
   const authData = decoded.get('authData');
   if (!(authData instanceof Uint8Array)) {
     throw new Error('Invalid authData');
@@ -174,11 +174,7 @@ export async function verifyRegistration(input: RegistrationVerificationInput): 
   if (!parsedAuthData.credentialId || !parsedAuthData.credentialPublicKeyBytes) {
     throw new Error('Missing attested credential data');
   }
-  const coseItems = decodeMultiple(parsedAuthData.credentialPublicKeyBytes) as Array<Map<number, unknown>>;
-  const coseStruct = coseItems[0];
-  if (!coseStruct) {
-    throw new Error('Invalid credential public key');
-  }
+  const coseStruct = new Decoder({ mapsAsObjects: false }).decode(parsedAuthData.credentialPublicKeyBytes) as Map<number, unknown>;
   const publicKeyJwk = coseEc2KeyToJwk(coseStruct);
   const credentialId = toBase64Url(parsedAuthData.credentialId);
   return {

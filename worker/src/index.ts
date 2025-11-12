@@ -129,7 +129,12 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       return json(status);
     }
     if (request.method === 'POST' && path === '/admin/register/start') {
-      const body = await request.json();
+      let body: any = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
       return json(await startRegistration(body, request, env));
     }
     if (request.method === 'POST' && path === '/admin/register/finish') {
@@ -191,16 +196,22 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 }
 
 async function startRegistration(body: any, request: Request, env: Env) {
-  const { email, displayName } = body ?? {};
-  if (!email || !displayName) {
-    throw new Error('Email and displayName are required');
-  }
   const status = await getAdminStatus(env);
   if (status.registered) {
     throw new Error('Admin already registered');
   }
-  const origin = new URL(request.url).origin;
-  const rpId = new URL(request.url).hostname;
+  const url = new URL(request.url);
+  const rpId = url.hostname;
+  const origin = url.origin;
+  const suffix = crypto.randomUUID().split('-')[0];
+  const derivedEmail = `admin+${suffix}@${rpId}`;
+  const fallbackName = `Owner ${suffix}`;
+  const email =
+    typeof body?.email === 'string' && body.email.trim().length > 0 ? body.email.trim().toLowerCase() : derivedEmail;
+  const displayName =
+    typeof body?.displayName === 'string' && body.displayName.trim().length > 0
+      ? body.displayName.trim()
+      : fallbackName;
   const challenge = randomChallenge();
   const userId = randomChallenge(32);
   await challengeRequest(env, 'create', {
