@@ -331,8 +331,9 @@ export async function verifyAssertion(input: AssertionVerificationInput): Promis
   if (!verified) {
     throw new Error('Invalid assertion signature');
   }
-  if (parsedAuthData.counter <= input.prevCounter) {
+  const { counter } = parsedAuthData;
+  if ((counter > 0 || input.prevCounter > 0) && counter <= input.prevCounter) {
     throw new Error('Authenticator counter did not advance');
   }
-  return { newCounter: parsedAuthData.counter };
+  return { newCounter: counter };
 }
