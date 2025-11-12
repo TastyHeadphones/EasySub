@@ -218,3 +218,39 @@ a {
 .schedule__option input[type='datetime-local'] {
   max-width: 200px;
 }
+
+.panel__bulk {
+  display: flex;
+  gap: 16px;
+  align-items: flex-end;
+  margin-bottom: 16px;
+}
+
+.panel__bulk label {
+  flex: 1;
+}
+
+.panel__bulk button {
+  height: fit-content;
+}
+
+.list__body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.edit {
+  border-top: 1px solid rgba(15, 23, 42, 0.1);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.edit__actions {
+  display: flex;
+  justify-content: flex-end;
+}

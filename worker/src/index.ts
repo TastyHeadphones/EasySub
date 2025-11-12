@@ -175,6 +175,26 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       const created = await subsRequest<SubscriptionRecord>(env, 'create', normalized);
       return json(created, undefined, 201);
     }
+    if (request.method === 'PUT' && path.startsWith('/subscriptions/')) {
+      const id = path.split('/')[2];
+      if (!id) {
+        throw new Error('Subscription id is required');
+      }
+      const payload = await request.json();
+      const updated = await updateSubscription(id, payload, env);
+      return json(updated);
+    }
+    if (request.method === 'POST' && path === '/subscriptions/bulk/link') {
+      let body: any = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+      const linkUrl = normalizeLinkUrl(String(body?.linkUrl ?? ''));
+      const result = await subsRequest<{ updated: number }>(env, 'bulkLink', { linkUrl });
+      return json(result);
+    }
     if (request.method === 'DELETE' && path.startsWith('/subscriptions/')) {
       const id = path.split('/')[2];
       await subsRequest(env, 'delete', { id });
@@ -361,13 +381,7 @@ function prepareSubscriptionPayload(body: any): SubscriptionInput {
   if (!name || !rawLink) {
     throw new Error('Name and link are required');
   }
-  let linkUrl: string;
-  try {
-    const parsed = new URL(rawLink);
-    linkUrl = parsed.toString();
-  } catch {
-    throw new Error('Link must be a valid URL');
-  }
+  const linkUrl = normalizeLinkUrl(rawLink);
   const intervalDaysValue = body?.intervalDays;
   const hasInterval = intervalDaysValue !== undefined && intervalDaysValue !== null && intervalDaysValue !== '';
   let intervalDays: number | undefined;
@@ -409,6 +423,80 @@ function prepareSubscriptionPayload(body: any): SubscriptionInput {
     invokeAt,
     expiresAt,
   };
+}
+
+function normalizeLinkUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error('Link must be a valid URL');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Link must be a valid URL');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Link must be HTTP(S)');
+  }
+  return parsed.toString();
+}
+
+function prepareSubscriptionUpdate(body: any, existing: SubscriptionRecord): SubscriptionInput {
+  const name =
+    typeof body?.name === 'string' && body.name.trim().length > 0 ? body.name.trim() : existing.name;
+  const linkSource =
+    typeof body?.linkUrl === 'string' && body.linkUrl.trim().length > 0 ? body.linkUrl : existing.linkUrl;
+  const scheduleMode = body?.scheduleMode === 'invoke' ? 'invoke' : body?.scheduleMode === 'interval' ? 'interval' : null;
+  let intervalDays = scheduleMode === 'invoke' ? undefined : existing.intervalDays;
+  if (body?.intervalDays !== undefined && body.intervalDays !== null && body.intervalDays !== '') {
+    const parsed = Number(body.intervalDays);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error('Interval days must be a positive number');
+    }
+    intervalDays = Math.round(parsed);
+  }
+  if (scheduleMode === 'interval' && !intervalDays) {
+    throw new Error('Interval days must be a positive number');
+  }
+  let invokeAt = scheduleMode === 'interval' ? undefined : existing.invokeAt;
+  const invokeInput = body?.invokeAt ?? body?.invokeDate;
+  if (invokeInput !== undefined && invokeInput !== null && invokeInput !== '') {
+    const timestamp = typeof invokeInput === 'number' ? invokeInput : new Date(invokeInput).getTime();
+    if (Number.isNaN(timestamp)) {
+      throw new Error('Invoke date is invalid');
+    }
+    invokeAt = timestamp;
+  }
+  if (scheduleMode === 'invoke' && !invokeAt) {
+    throw new Error('Invoke date is invalid');
+  }
+  let expiresAt: number | undefined;
+  if (typeof body?.expiresAt === 'number') {
+    expiresAt = body.expiresAt;
+  } else if (invokeAt) {
+    expiresAt = invokeAt;
+  } else if (intervalDays) {
+    expiresAt = Date.now() + intervalDays * 24 * 60 * 60 * 1000;
+  } else {
+    expiresAt = existing.expiresAt;
+  }
+  return prepareSubscriptionPayload({
+    name,
+    linkUrl: linkSource,
+    intervalDays,
+    invokeAt,
+    expiresAt,
+  });
+}
+
+async function updateSubscription(id: string, body: any, env: Env) {
+  const existing = await subsRequest<SubscriptionRecord | null>(env, 'get', { id });
+  if (!existing) {
+    throw new Error('Subscription not found');
+  }
+  const normalized = prepareSubscriptionUpdate(body, existing);
+  return subsRequest<SubscriptionRecord>(env, 'update', { id, patch: normalized });
 }
 
 async function runCron(env: Env) {
@@ -472,74 +560,23 @@ async function handlePublicLink(request: Request, env: Env) {
     return new Response('Subscription missing', { status: 404 });
   }
   let fetchedText = '';
-  let fetchError = '';
   try {
     const response = await fetch(subscription.linkUrl, { method: 'GET' });
     if (!response.ok) {
       throw new Error(`Remote link returned ${response.status}`);
     }
     const text = await response.text();
-    fetchedText = text.slice(0, 5000);
+    fetchedText = text;
   } catch (error) {
-    fetchError = `Unable to load linked content: ${
-      error instanceof Error ? error.message : 'Unknown error'
-    }`;
+    const message = `Unable to load linked content: ${error instanceof Error ? error.message : 'Unknown error'}`;
+    return new Response(message, {
+      status: 502,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+    });
   }
-  const scheduleParts: string[] = [];
-  if (subscription.intervalDays) {
-    scheduleParts.push(`Interval: every ${subscription.intervalDays} day${subscription.intervalDays === 1 ? '' : 's'}`);
-  }
-  if (subscription.invokeAt) {
-    scheduleParts.push(`Invokes on ${new Date(subscription.invokeAt).toLocaleString('en-US')}`);
-  }
-  scheduleParts.push(`Valid until ${new Date(subscription.expiresAt).toLocaleString('en-US')}`);
-  const safeName = escapeHtml(subscription.name);
-  const safeLink = escapeHtml(subscription.linkUrl);
-  const safeBody = escapeHtml(fetchedText || fetchError || 'No content available');
-  const metaHtml = scheduleParts.map((line) => `<p class="meta">${escapeHtml(line)}</p>`).join('');
-  const html = `<!doctype html>
-  <html>
-    <head>
-      <meta charset="utf-8" />
-      <title>${safeName} · EasySub</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <style>
-        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 32px; background: #f6f6f9; }
-        .card { max-width: 640px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 32px; box-shadow: 0 10px 30px rgba(15,23,42,0.1); }
-        h1 { margin-top: 0; font-size: 1.8rem; }
-        .meta { color: #475569; margin-top: 8px; }
-        pre { background: #f8fafc; padding: 16px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; }
-        a { color: #2563eb; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>${safeName}</h1>
-        <p class="meta"><a href="${safeLink}" target="_blank" rel="noreferrer">Source link</a></p>
-        ${metaHtml}
-        <pre>${safeBody}</pre>
-      </div>
-    </body>
-  </html>`;
-  return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
-}
-
-function escapeHtml(value: string) {
-  return value.replace(/[&<>"']/g, (char) => {
-    switch (char) {
-      case '&':
-        return '&amp;';
-      case '<':
-        return '&lt;';
-      case '>':
-        return '&gt;';
-      case '"':
-        return '&quot;';
-      case "'":
-        return '&#39;';
-      default:
-        return char;
-    }
+  return new Response(fetchedText, {
+    status: 200,
+    headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
   });
 }
 
@@ -884,7 +921,12 @@ export class SubscriptionStore extends BaseStore<SubscriptionState> implements D
   async fetch(request: Request) {
     await this.ready;
     const { action, data } = (await request.json()) as DoMessage<
-      Partial<SubscriptionInput> & { id?: string; now?: number }
+      Partial<SubscriptionInput> & {
+        id?: string;
+        now?: number;
+        patch?: Partial<SubscriptionRecord>;
+        linkUrl?: string;
+      }
     >;
     const payload = data ?? {};
     if (action === 'list') {
@@ -905,6 +947,38 @@ export class SubscriptionStore extends BaseStore<SubscriptionState> implements D
       this.data.items[id] = record;
       await this.persist();
       return Response.json(record);
+    }
+    if (action === 'update') {
+      const id = payload.id;
+      const patch = payload.patch as Partial<SubscriptionRecord> | undefined;
+      if (!id || !patch) {
+        return new Response('Invalid update payload', { status: 400 });
+      }
+      const existing = this.data.items[id];
+      if (!existing) {
+        return new Response('Subscription not found', { status: 404 });
+      }
+      const next: SubscriptionRecord = {
+        ...existing,
+        ...patch,
+        id: existing.id,
+        createdAt: existing.createdAt,
+      };
+      this.data.items[id] = next;
+      await this.persist();
+      return Response.json(next);
+    }
+    if (action === 'bulkLink') {
+      const linkUrl = payload.linkUrl;
+      if (!linkUrl) {
+        return new Response('linkUrl is required', { status: 400 });
+      }
+      const items = Object.values(this.data.items);
+      items.forEach((item) => {
+        item.linkUrl = linkUrl;
+      });
+      await this.persist();
+      return Response.json({ updated: items.length });
     }
     if (action === 'delete') {
       if (payload.id) {

@@ -24,6 +24,13 @@ type ShareLookup = Record<string, string>;
 
 type ScheduleMode = 'interval' | 'invoke';
 
+interface EditState {
+  linkUrl: string;
+  scheduleMode: ScheduleMode;
+  intervalDays: string;
+  invokeDate: string;
+}
+
 const FORM_DEFAULT = {
   name: '',
   linkUrl: '',
@@ -34,6 +41,20 @@ const FORM_DEFAULT = {
 
 type FormState = typeof FORM_DEFAULT;
 
+const toLocalInputValue = (timestamp: number) => {
+  const date = new Date(timestamp);
+  const offset = date.getTimezoneOffset();
+  const local = new Date(date.getTime() - offset * 60 * 1000);
+  return local.toISOString().slice(0, 16);
+};
+
+const deriveEditState = (sub: SubscriptionRecord): EditState => ({
+  linkUrl: sub.linkUrl,
+  scheduleMode: sub.invokeAt ? 'invoke' : 'interval',
+  intervalDays: sub.intervalDays ? String(sub.intervalDays) : '',
+  invokeDate: sub.invokeAt ? toLocalInputValue(sub.invokeAt) : '',
+});
+
 const App = () => {
   const [phase, setPhase] = useState<Phase>('loading');
   const [busy, setBusy] = useState(false);
@@ -41,6 +62,10 @@ const App = () => {
   const [subs, setSubs] = useState<SubscriptionRecord[]>([]);
   const [shares, setShares] = useState<ShareLookup>({});
   const [form, setForm] = useState<FormState>({ ...FORM_DEFAULT });
+  const [edits, setEdits] = useState<Record<string, EditState>>({});
+  const [bulkLink, setBulkLink] = useState('');
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [bulkUpdating, setBulkUpdating] = useState(false);
   const passkeySupported = useMemo(() => typeof window !== 'undefined' && 'PublicKeyCredential' in window, []);
 
   useEffect(() => {
@@ -64,6 +89,28 @@ const App = () => {
     } catch (err) {
       setError((err as Error).message);
     }
+  };
+
+  useEffect(() => {
+    const next: Record<string, EditState> = {};
+    subs.forEach((sub) => {
+      next[sub.id] = deriveEditState(sub);
+    });
+    setEdits(next);
+  }, [subs]);
+
+  const updateEditState = (id: string, patch: Partial<EditState>) => {
+    setEdits((prev) => {
+      const source = subs.find((s) => s.id === id);
+      const fallback: EditState = source
+        ? deriveEditState(source)
+        : { linkUrl: '', scheduleMode: 'interval', intervalDays: '', invokeDate: '' };
+      const base = prev[id] ?? fallback;
+      return {
+        ...prev,
+        [id]: { ...base, ...patch },
+      };
+    });
   };
 
   const handleRegister = async () => {
@@ -174,6 +221,48 @@ const App = () => {
     }
   };
 
+  const handleUpdateSub = async (id: string) => {
+    const source = subs.find((sub) => sub.id === id);
+    const state = edits[id] ?? (source ? deriveEditState(source) : null);
+    if (!state) return;
+    setUpdatingId(id);
+    setError(null);
+    try {
+      const payload: Record<string, unknown> = {
+        linkUrl: state.linkUrl.trim(),
+        scheduleMode: state.scheduleMode,
+      };
+      if (!payload.linkUrl) {
+        throw new Error('Link is required');
+      }
+      if (state.scheduleMode === 'interval') {
+        const days = Number(state.intervalDays);
+        if (!Number.isFinite(days) || days <= 0) {
+          throw new Error('Enter a valid interval');
+        }
+        payload.intervalDays = Math.round(days);
+      } else {
+        if (!state.invokeDate) {
+          throw new Error('Pick an invoke date');
+        }
+        const timestamp = new Date(state.invokeDate).getTime();
+        if (Number.isNaN(timestamp)) {
+          throw new Error('Invoke date is invalid');
+        }
+        payload.invokeAt = timestamp;
+      }
+      await apiFetch(`/api/subscriptions/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      await refreshSubs();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
   const handleShare = async (id: string) => {
     try {
       const result = await apiFetch<{ slug: string }>(`/api/subscriptions/${id}/share`, { method: 'POST' });
@@ -187,6 +276,28 @@ const App = () => {
     if (!confirm('Delete this subscription?')) return;
     await apiFetch(`/api/subscriptions/${id}`, { method: 'DELETE' });
     await refreshSubs();
+  };
+
+  const handleBulkLinkUpdate = async (evt: FormEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+    if (!bulkLink.trim()) {
+      setError('Enter a link to apply');
+      return;
+    }
+    setBulkUpdating(true);
+    setError(null);
+    try {
+      await apiFetch('/api/subscriptions/bulk/link', {
+        method: 'POST',
+        body: JSON.stringify({ linkUrl: bulkLink.trim() }),
+      });
+      setBulkLink('');
+      await refreshSubs();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBulkUpdating(false);
+    }
   };
 
   const renderContent = () => {
@@ -233,6 +344,21 @@ const App = () => {
             </button>
           </div>
         </header>
+        <form className="panel__bulk" onSubmit={handleBulkLinkUpdate}>
+          <label>
+            Apply link to all subscriptions
+            <input
+              type="url"
+              placeholder="https://example.com/broadcast.txt"
+              value={bulkLink}
+              onChange={(e) => setBulkLink(e.target.value)}
+              required
+            />
+          </label>
+          <button type="submit" disabled={bulkUpdating || !bulkLink.trim()}>
+            {bulkUpdating ? 'Updating…' : 'Update all links'}
+          </button>
+        </form>
         <div className="grid">
           <form onSubmit={handleCreateSub} className="card stack">
             <h3>New subscription</h3>
@@ -303,22 +429,84 @@ const App = () => {
               <ul className="list">
                 {subs.map((sub) => (
                   <li key={sub.id} className="list__item">
-                    <div>
-                      <h4>{sub.name}</h4>
-                      <p className="muted">
-                        {sub.invokeAt
-                          ? `Invokes on ${new Date(sub.invokeAt).toLocaleString()}`
-                          : sub.intervalDays
-                            ? `Interval: every ${sub.intervalDays} day${sub.intervalDays === 1 ? '' : 's'}`
-                            : 'Custom schedule'}
-                      </p>
-                      <p className="muted">
-                        Link: <a href={sub.linkUrl} target="_blank" rel="noreferrer">{sub.linkUrl}</a>
-                      </p>
-                      <p className="muted">Expires: {new Date(sub.expiresAt).toLocaleString()}</p>
-                      {shares[sub.id] && (
-                        <p className="share">Share link: <a href={shares[sub.id]} target="_blank" rel="noreferrer">{shares[sub.id]}</a></p>
-                      )}
+                    <div className="list__body">
+                      <div>
+                        <h4>{sub.name}</h4>
+                        <p className="muted">
+                          {sub.invokeAt
+                            ? `Invokes on ${new Date(sub.invokeAt).toLocaleString()}`
+                            : sub.intervalDays
+                              ? `Interval: every ${sub.intervalDays} day${sub.intervalDays === 1 ? '' : 's'}`
+                              : 'Custom schedule'}
+                        </p>
+                        <p className="muted">
+                          Link: <a href={sub.linkUrl} target="_blank" rel="noreferrer">{sub.linkUrl}</a>
+                        </p>
+                        <p className="muted">Expires: {new Date(sub.expiresAt).toLocaleString()}</p>
+                        {shares[sub.id] && (
+                          <p className="share">Share link: <a href={shares[sub.id]} target="_blank" rel="noreferrer">{shares[sub.id]}</a></p>
+                        )}
+                      </div>
+                      <div className="edit">
+                        <label>
+                          Link
+                          <input
+                            type="url"
+                            value={edits[sub.id]?.linkUrl ?? sub.linkUrl}
+                            onChange={(e) => updateEditState(sub.id, { linkUrl: e.target.value })}
+                            required
+                          />
+                        </label>
+                        <div className="schedule stack">
+                          <span className="muted">Schedule</span>
+                          <div className="schedule__option">
+                            <label>
+                              <input
+                                type="radio"
+                                name={`schedule-${sub.id}`}
+                                value="interval"
+                                checked={(edits[sub.id]?.scheduleMode ?? 'interval') === 'interval'}
+                                onChange={() => updateEditState(sub.id, { scheduleMode: 'interval' })}
+                              />
+                              <span>Interval (days)</span>
+                            </label>
+                            {(edits[sub.id]?.scheduleMode ?? 'interval') === 'interval' && (
+                              <input
+                                type="number"
+                                min="1"
+                                value={edits[sub.id]?.intervalDays ?? ''}
+                                onChange={(e) => updateEditState(sub.id, { intervalDays: e.target.value })}
+                                required
+                              />
+                            )}
+                          </div>
+                          <div className="schedule__option">
+                            <label>
+                              <input
+                                type="radio"
+                                name={`schedule-${sub.id}`}
+                                value="invoke"
+                                checked={edits[sub.id]?.scheduleMode === 'invoke'}
+                                onChange={() => updateEditState(sub.id, { scheduleMode: 'invoke' })}
+                              />
+                              <span>Invoke on date</span>
+                            </label>
+                            {edits[sub.id]?.scheduleMode === 'invoke' && (
+                              <input
+                                type="datetime-local"
+                                value={edits[sub.id]?.invokeDate ?? ''}
+                                onChange={(e) => updateEditState(sub.id, { invokeDate: e.target.value })}
+                                required
+                              />
+                            )}
+                          </div>
+                        </div>
+                        <div className="edit__actions">
+                          <button type="button" onClick={() => handleUpdateSub(sub.id)} disabled={updatingId === sub.id}>
+                            {updatingId === sub.id ? 'Saving…' : 'Save changes'}
+                          </button>
+                        </div>
+                      </div>
                     </div>
                     <div className="actions">
                       <button type="button" onClick={() => handleShare(sub.id)}>
