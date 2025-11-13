@@ -49,6 +49,7 @@ interface SubscriptionRecord {
   createdAt: number;
   expiresAt: number;
   status: 'active' | 'expired';
+  shareSlug?: string;
 }
 
 interface SubscriptionInput {
@@ -165,6 +166,14 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       return json({ error: 'Unauthorized' }, undefined, 401);
     }
 
+    if (request.method === 'POST' && path === '/admin/reset') {
+      await resetAll(env);
+      return json(
+        { ok: true },
+        `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0; Expires=${new Date(0).toUTCString()}`,
+      );
+    }
+
     if (request.method === 'GET' && path === '/subscriptions') {
       const subs = await subsRequest<SubscriptionRecord[]>(env, 'list');
       return json({ items: subs });
@@ -206,7 +215,11 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       if (!subscription) {
         throw new Error('Subscription not found');
       }
-      const share = await linkRequest<ShareLinkRecord>(env, 'create', { subscriptionId: id, expiresAt: subscription.expiresAt });
+      const share = await linkRequest<ShareLinkRecord>(env, 'create', {
+        subscriptionId: id,
+        expiresAt: subscription.expiresAt,
+      });
+      await subsRequest<SubscriptionRecord>(env, 'update', { id, patch: { shareSlug: share.slug } });
       return json(share, undefined, 201);
     }
     return json({ error: 'Not found' }, undefined, 404);
@@ -507,6 +520,18 @@ async function runCron(env: Env) {
   ]);
 }
 
+async function resetAll(env: Env) {
+  await Promise.all([
+    adminRequest(env, 'reset'),
+    credsRequest(env, 'reset'),
+    challengeRequest(env, 'reset'),
+    sessionRequest(env, 'reset'),
+    subsRequest(env, 'reset'),
+    linkRequest(env, 'reset'),
+    outboxRequest(env, 'reset'),
+  ]);
+}
+
 async function flushOutbox(env: Env) {
   const pending = await outboxRequest<OutboxMessage[]>(env, 'pending');
   for (const message of pending as OutboxMessage[]) {
@@ -544,12 +569,34 @@ async function deliverEmail(message: OutboxMessage, env: Env): Promise<boolean> 
   }
 }
 
+const MIRROR_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const PROXY_ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
 async function handlePublicLink(request: Request, env: Env) {
   const url = new URL(request.url);
   const segments = url.pathname.split('/');
   const slug = segments[2];
+  const extraPath = segments.slice(3).join('/');
   if (!slug) {
     return new Response('Link not found', { status: 404 });
+  }
+  const method = request.method.toUpperCase();
+  if (!PROXY_ALLOWED_METHODS.has(method)) {
+    return new Response('Method not allowed', {
+      status: 405,
+      headers: { allow: Array.from(PROXY_ALLOWED_METHODS).join(',') },
+    });
   }
   const link = await linkRequest<ShareLinkRecord | null>(env, 'get', { slug });
   if (!link || !link.active) {
@@ -559,25 +606,326 @@ async function handlePublicLink(request: Request, env: Env) {
   if (!subscription) {
     return new Response('Subscription missing', { status: 404 });
   }
-  let fetchedText = '';
+  const baseUrl = new URL(subscription.linkUrl);
+  const targetUrl = new URL(subscription.linkUrl);
+  if (extraPath) {
+    targetUrl.pathname = ensureAbsolutePath(extraPath);
+  }
+  if (url.search) {
+    targetUrl.search = url.search;
+  }
+  let upstream: Response;
   try {
-    const response = await fetch(subscription.linkUrl, { method: 'GET' });
-    if (!response.ok) {
-      throw new Error(`Remote link returned ${response.status}`);
-    }
-    const text = await response.text();
-    fetchedText = text;
+    upstream = await fetch(targetUrl.toString(), {
+      method,
+      headers: buildUpstreamHeaders(request, targetUrl, baseUrl, slug),
+      redirect: 'manual',
+      body: ['GET', 'HEAD'].includes(method) ? undefined : request.body,
+    });
   } catch (error) {
-    const message = `Unable to load linked content: ${error instanceof Error ? error.message : 'Unknown error'}`;
+    const message = `Unable to reach upstream: ${error instanceof Error ? error.message : 'Unknown error'}`;
     return new Response(message, {
       status: 502,
       headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
     });
   }
-  return new Response(fetchedText, {
-    status: 200,
-    headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+  return createMirrorResponse(upstream, { slug, baseUrl, targetUrl });
+}
+
+interface MirrorContext {
+  slug: string;
+  baseUrl: URL;
+  targetUrl: URL;
+}
+
+function ensureAbsolutePath(path: string): string {
+  if (!path) return '/';
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+function buildUpstreamHeaders(request: Request, targetUrl: URL, baseUrl: URL, slug: string): Headers {
+  const headers = new Headers();
+  const forward = [
+    'accept',
+    'accept-language',
+    'content-type',
+    'cookie',
+    'sec-fetch-mode',
+    'sec-fetch-site',
+    'sec-fetch-dest',
+    'user-agent',
+  ];
+  request.headers.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (forward.includes(lower)) {
+      headers.set(key, value);
+    }
   });
+  const referer = mapUpstreamReferer(request.headers.get('referer'), slug, baseUrl);
+  if (referer) {
+    headers.set('referer', referer);
+  } else if (!headers.has('referer')) {
+    headers.set('referer', baseUrl.origin);
+  }
+  if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
+    headers.set('origin', baseUrl.origin);
+  }
+  const ua = request.headers.get('user-agent');
+  if (!ua || ua.includes('curl') || ua.includes('Cloudflare-Workers')) {
+    headers.set('user-agent', MIRROR_USER_AGENT);
+  }
+  if (!headers.has('user-agent')) {
+    headers.set('user-agent', MIRROR_USER_AGENT);
+  }
+  if (!headers.has('accept')) {
+    headers.set('accept', '*/*');
+  }
+  if (!headers.has('accept-language')) {
+    headers.set('accept-language', 'en-US,en;q=0.9');
+  }
+  headers.delete('accept-encoding');
+  return headers;
+}
+
+function mapUpstreamReferer(referer: string | null, slug: string, baseUrl: URL): string | undefined {
+  if (!referer) return undefined;
+  try {
+    const parsed = new URL(referer);
+    const parts = parsed.pathname.split('/');
+    if (parts[1] !== 's' || parts[2] !== slug) {
+      return undefined;
+    }
+    const extra = parts.slice(3).join('/');
+    const upstream = new URL(baseUrl.toString());
+    if (extra) {
+      upstream.pathname = ensureAbsolutePath(extra);
+    }
+    upstream.search = parsed.search;
+    return upstream.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function createMirrorResponse(response: Response, context: MirrorContext): Response {
+  const headers = filterUpstreamHeaders(response.headers, context);
+  const contentType = headers.get('content-type') ?? '';
+  if (contentType.includes('text/html') && response.body) {
+    headers.delete('content-length');
+    const injector = new MirrorScriptInjector(context.slug);
+    const rewriter = new HTMLRewriter()
+      .on('a[href]', new MirrorAttributeRewriter(context, [{ name: 'href' }]))
+      .on('link[href]', new MirrorAttributeRewriter(context, [{ name: 'href' }]))
+      .on('img[src]', new MirrorAttributeRewriter(context, [{ name: 'src' }]))
+      .on('img[srcset]', new MirrorAttributeRewriter(context, [{ name: 'srcset', isSrcset: true }]))
+      .on('script[src]', new MirrorAttributeRewriter(context, [{ name: 'src' }]))
+      .on('form[action]', new MirrorAttributeRewriter(context, [{ name: 'action' }]))
+      .on('iframe[src]', new MirrorAttributeRewriter(context, [{ name: 'src' }]))
+      .on('video', new MirrorAttributeRewriter(context, [{ name: 'src' }, { name: 'poster' }]))
+      .on('audio[src]', new MirrorAttributeRewriter(context, [{ name: 'src' }]))
+      .on('source', new MirrorAttributeRewriter(context, [{ name: 'src' }, { name: 'srcset', isSrcset: true }]))
+      .on('use[href]', new MirrorAttributeRewriter(context, [{ name: 'href' }]))
+      .on('head', injector)
+      .on('body', injector);
+    return rewriter.transform(new Response(response.body, { status: response.status, headers }));
+  }
+  return new Response(response.body, { status: response.status, headers });
+}
+
+function filterUpstreamHeaders(source: Headers, context: MirrorContext): Headers {
+  const headers = new Headers();
+  source.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower) || lower === 'content-length') {
+      return;
+    }
+    if (lower === 'location') {
+      headers.set('location', rewriteLocation(value, context));
+      return;
+    }
+    if (lower === 'set-cookie') {
+      const cookie = rewriteSetCookie(value, context.slug);
+      if (cookie) {
+        headers.append('set-cookie', cookie);
+      }
+      return;
+    }
+    headers.append(key, value);
+  });
+  headers.set('cache-control', 'no-store');
+  return headers;
+}
+
+function rewriteLocation(value: string, context: MirrorContext): string {
+  try {
+    const next = new URL(value, context.targetUrl);
+    if (next.host === context.baseUrl.host) {
+      return buildProxyPath(context.slug, next.pathname, next.search);
+    }
+    return next.toString();
+  } catch {
+    return value;
+  }
+}
+
+function rewriteSetCookie(value: string, slug: string): string | null {
+  if (!value) return null;
+  let next = value.replace(/;\s*Domain=[^;]+/gi, '');
+  if (/;\s*Path=/i.test(next)) {
+    next = next.replace(/;\s*Path=([^;]+)/i, (_, pathValue) => `; Path=${buildCookiePath(slug, pathValue ?? '/')}`);
+  } else {
+    next = `${next}; Path=/s/${slug}`;
+  }
+  return next;
+}
+
+function buildCookiePath(slug: string, original: string): string {
+  const cleaned = original?.trim() || '/';
+  if (!cleaned || cleaned === '/') {
+    return `/s/${slug}`;
+  }
+  const normalized = cleaned.startsWith('/') ? cleaned : `/${cleaned}`;
+  return `/s/${slug}${normalized}`;
+}
+
+function buildProxyPath(slug: string, pathname: string, search: string): string {
+  const normalized = pathname.startsWith('/') ? pathname : `/${pathname}`;
+  return `/s/${slug}${normalized}${search ?? ''}`;
+}
+
+type MirrorAttributeConfig = { name: string; isSrcset?: boolean };
+
+class MirrorAttributeRewriter {
+  private context: MirrorContext;
+  private attributes: MirrorAttributeConfig[];
+
+  constructor(context: MirrorContext, attributes: MirrorAttributeConfig[]) {
+    this.context = context;
+    this.attributes = attributes;
+  }
+
+  element(element: Element) {
+    for (const attr of this.attributes) {
+      const value = element.getAttribute(attr.name);
+      if (!value) continue;
+      if (attr.isSrcset) {
+        const rewritten = rewriteSrcset(value, this.context);
+        if (rewritten !== value) {
+          element.setAttribute(attr.name, rewritten);
+        }
+        continue;
+      }
+      const next = rewriteProxiedValue(value, this.context);
+      if (next && next !== value) {
+        element.setAttribute(attr.name, next);
+      }
+    }
+  }
+}
+
+class MirrorScriptInjector {
+  private slug: string;
+  private injected = false;
+
+  constructor(slug: string) {
+    this.slug = slug;
+  }
+
+  element(element: Element) {
+    if (this.injected) return;
+    element.prepend(buildMirrorBootstrap(this.slug), { html: true });
+    this.injected = true;
+  }
+}
+
+function rewriteSrcset(value: string, context: MirrorContext): string {
+  return value
+    .split(',')
+    .map((entry) => {
+      const trimmed = entry.trim();
+      if (!trimmed) return trimmed;
+      const parts = trimmed.split(/\s+/);
+      const urlPart = parts.shift();
+      if (!urlPart) return trimmed;
+      const rewritten = rewriteProxiedValue(urlPart, context);
+      if (!rewritten) {
+        return trimmed;
+      }
+      return [rewritten, ...parts].join(' ');
+    })
+    .join(', ');
+}
+
+function rewriteProxiedValue(value: string, context: MirrorContext): string | null {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('javascript:') || trimmed.startsWith('mailto:') || trimmed.startsWith('#')) {
+    return null;
+  }
+  try {
+    const resolved = new URL(trimmed, context.targetUrl);
+    if (!['http:', 'https:'].includes(resolved.protocol)) {
+      return trimmed;
+    }
+    if (resolved.host === context.baseUrl.host) {
+      return buildProxyPath(context.slug, resolved.pathname, resolved.search);
+    }
+    return resolved.toString();
+  } catch {
+    if (trimmed.startsWith('//')) {
+      try {
+        const resolved = new URL(`${context.baseUrl.protocol}${trimmed}`);
+        if (resolved.host === context.baseUrl.host) {
+          return buildProxyPath(context.slug, resolved.pathname, resolved.search);
+        }
+        return resolved.toString();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function buildMirrorBootstrap(slug: string): string {
+  const prefix = `/s/${slug}`;
+  const script = `
+    <script>
+      (() => {
+        const prefix = ${JSON.stringify(prefix)};
+        const toProxied = (value) => {
+          if (!value) return null;
+          try {
+            const url = new URL(value, window.location.href);
+            if (url.origin !== window.location.origin) {
+              return null;
+            }
+            if (url.pathname.startsWith(prefix)) {
+              return null;
+            }
+            url.pathname = prefix + (url.pathname.startsWith('/') ? url.pathname : '/' + url.pathname);
+            return url.toString();
+          } catch (err) {
+            return null;
+          }
+        };
+        const originalFetch = window.fetch;
+        window.fetch = function(input, init) {
+          if (typeof input === 'string') {
+            const next = toProxied(input);
+            if (next) {
+              input = next;
+            }
+          }
+          return originalFetch(input, init);
+        };
+        const open = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          const next = typeof url === 'string' ? toProxied(url) : null;
+          return open.call(this, method, next ?? url, ...rest);
+        };
+      })();
+    </script>`;
+  return script;
 }
 
 async function handleDevEmails(env: Env) {
@@ -731,6 +1079,11 @@ export class AdminStore extends BaseStore<AdminState> implements DurableObject {
       await this.persist();
       return Response.json(this.data);
     }
+    if (action === 'reset') {
+      this.data = { registered: false };
+      await this.persist();
+      return Response.json(this.data);
+    }
     return new Response('Unknown action', { status: 400 });
   }
 }
@@ -776,6 +1129,11 @@ export class CredentialStore extends BaseStore<CredentialState> implements Durab
         return Response.json(existing);
       }
       return new Response('Unknown credential', { status: 404 });
+    }
+    if (action === 'reset') {
+      this.data = { items: {} };
+      await this.persist();
+      return Response.json({ ok: true });
     }
     return new Response('Unknown action', { status: 400 });
   }
@@ -834,6 +1192,11 @@ export class ChallengeStore extends BaseStore<ChallengeState> implements Durable
       delete this.data.records[challenge];
       await this.persist();
       return Response.json(record);
+    }
+    if (action === 'reset') {
+      this.data = { records: {} };
+      await this.persist();
+      return Response.json({ ok: true });
     }
     return new Response('Unknown action', { status: 400 });
   }
@@ -905,6 +1268,11 @@ export class SessionStore extends BaseStore<SessionState> implements DurableObje
       }
       return Response.json({ ok: true });
     }
+    if (action === 'reset') {
+      this.data = { sessions: {} };
+      await this.persist();
+      return Response.json({ ok: true });
+    }
     return new Response('Unknown action', { status: 400 });
   }
 }
@@ -943,6 +1311,7 @@ export class SubscriptionStore extends BaseStore<SubscriptionState> implements D
         createdAt: Date.now(),
         expiresAt: payload.expiresAt ?? payload.invokeAt ?? Date.now(),
         status: 'active',
+        shareSlug: undefined,
       };
       this.data.items[id] = record;
       await this.persist();
@@ -1002,21 +1371,31 @@ export class SubscriptionStore extends BaseStore<SubscriptionState> implements D
       if (changed) await this.persist();
       return Response.json({ ok: true });
     }
+    if (action === 'reset') {
+      this.data = { items: {} };
+      await this.persist();
+      return Response.json({ ok: true });
+    }
     return new Response('Unknown action', { status: 400 });
   }
 }
 
 interface LinkState {
   items: Record<string, ShareLinkRecord>;
+  bySubscription: Record<string, string>;
 }
 
 export class LinkStore extends BaseStore<LinkState> implements DurableObject {
   constructor(state: DurableObjectState) {
-    super(state, { items: {} });
+    super(state, { items: {}, bySubscription: {} });
   }
 
   async fetch(request: Request) {
     await this.ready;
+    if (!this.data.bySubscription) {
+      this.data.bySubscription = {};
+      await this.persist();
+    }
     const { action, data } = (await request.json()) as DoMessage<{
       subscriptionId?: string;
       expiresAt?: number;
@@ -1028,15 +1407,28 @@ export class LinkStore extends BaseStore<LinkState> implements DurableObject {
       if (!payload.subscriptionId) {
         return new Response('subscriptionId is required', { status: 400 });
       }
+      const now = Date.now();
+      const existingSlug = this.data.bySubscription[payload.subscriptionId];
+      if (existingSlug) {
+        const existing = this.data.items[existingSlug];
+        if (existing && existing.active && existing.expiresAt > now) {
+          return Response.json(existing);
+        }
+        delete this.data.bySubscription[payload.subscriptionId];
+        if (existingSlug) {
+          delete this.data.items[existingSlug];
+        }
+      }
       const slug = crypto.randomUUID().split('-')[0];
       const record: ShareLinkRecord = {
         slug,
         subscriptionId: payload.subscriptionId,
-        createdAt: Date.now(),
-        expiresAt: payload.expiresAt ?? Date.now() + 7 * 24 * 60 * 60 * 1000,
+        createdAt: now,
+        expiresAt: payload.expiresAt ?? now + 7 * 24 * 60 * 60 * 1000,
         active: true,
       };
       this.data.items[slug] = record;
+      this.data.bySubscription[payload.subscriptionId] = slug;
       await this.persist();
       return Response.json(record);
     }
@@ -1055,8 +1447,14 @@ export class LinkStore extends BaseStore<LinkState> implements DurableObject {
         if (!record) return;
         if (record.expiresAt <= now) {
           delete this.data.items[slug];
+          delete this.data.bySubscription[record.subscriptionId];
         }
       });
+      await this.persist();
+      return Response.json({ ok: true });
+    }
+    if (action === 'reset') {
+      this.data = { items: {}, bySubscription: {} };
       await this.persist();
       return Response.json({ ok: true });
     }
@@ -1115,6 +1513,11 @@ export class OutboxStore extends BaseStore<OutboxState> implements DurableObject
         await this.persist();
       }
       return Response.json(item ?? null);
+    }
+    if (action === 'reset') {
+      this.data = { items: {} };
+      await this.persist();
+      return Response.json({ ok: true });
     }
     return new Response('Unknown action', { status: 400 });
   }

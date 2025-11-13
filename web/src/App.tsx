@@ -16,11 +16,10 @@ interface SubscriptionRecord {
   createdAt: number;
   expiresAt: number;
   status: 'active' | 'expired';
+  shareSlug?: string;
 }
 
 type Phase = 'loading' | 'register' | 'login' | 'dashboard';
-
-type ShareLookup = Record<string, string>;
 
 type ScheduleMode = 'interval' | 'invoke';
 
@@ -60,12 +59,13 @@ const App = () => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [subs, setSubs] = useState<SubscriptionRecord[]>([]);
-  const [shares, setShares] = useState<ShareLookup>({});
   const [form, setForm] = useState<FormState>({ ...FORM_DEFAULT });
   const [edits, setEdits] = useState<Record<string, EditState>>({});
   const [bulkLink, setBulkLink] = useState('');
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [bulkUpdating, setBulkUpdating] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const shareOrigin = useMemo(() => (typeof window !== 'undefined' ? window.location.origin : ''), []);
   const passkeySupported = useMemo(() => typeof window !== 'undefined' && 'PublicKeyCredential' in window, []);
 
   useEffect(() => {
@@ -266,7 +266,9 @@ const App = () => {
   const handleShare = async (id: string) => {
     try {
       const result = await apiFetch<{ slug: string }>(`/api/subscriptions/${id}/share`, { method: 'POST' });
-      setShares((prev) => ({ ...prev, [id]: `${window.location.origin}/s/${result.slug}` }));
+      setSubs((prev) =>
+        prev.map((sub) => (sub.id === id ? { ...sub, shareSlug: result.slug } : sub)),
+      );
     } catch (err) {
       setError((err as Error).message);
     }
@@ -276,6 +278,26 @@ const App = () => {
     if (!confirm('Delete this subscription?')) return;
     await apiFetch(`/api/subscriptions/${id}`, { method: 'DELETE' });
     await refreshSubs();
+  };
+
+  const handleReset = async () => {
+    if (!confirm('Delete all data and reset the workspace? This cannot be undone.')) {
+      return;
+    }
+    setResetting(true);
+    setError(null);
+    try {
+      await apiFetch('/api/admin/reset', { method: 'POST' });
+      setSubs([]);
+      setEdits({});
+      setForm({ ...FORM_DEFAULT });
+      setBulkLink('');
+      await refreshStatus();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setResetting(false);
+    }
   };
 
   const handleBulkLinkUpdate = async (evt: FormEvent<HTMLFormElement>) => {
@@ -339,6 +361,9 @@ const App = () => {
             <a href="/dev/emails" target="_blank" rel="noreferrer">
               View dev emails
             </a>
+            <button type="button" className="ghost danger" onClick={handleReset} disabled={resetting}>
+              {resetting ? 'Resetting…' : 'Reset workspace'}
+            </button>
             <button onClick={handleLogout} className="ghost">
               Logout
             </button>
@@ -443,8 +468,13 @@ const App = () => {
                           Link: <a href={sub.linkUrl} target="_blank" rel="noreferrer">{sub.linkUrl}</a>
                         </p>
                         <p className="muted">Expires: {new Date(sub.expiresAt).toLocaleString()}</p>
-                        {shares[sub.id] && (
-                          <p className="share">Share link: <a href={shares[sub.id]} target="_blank" rel="noreferrer">{shares[sub.id]}</a></p>
+                        {sub.shareSlug && shareOrigin && (
+                          <p className="share">
+                            Share link:{' '}
+                            <a href={`${shareOrigin}/s/${sub.shareSlug}`} target="_blank" rel="noreferrer">
+                              {`${shareOrigin}/s/${sub.shareSlug}`}
+                            </a>
+                          </p>
                         )}
                       </div>
                       <div className="edit">
