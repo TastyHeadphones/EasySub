@@ -618,7 +618,7 @@ async function handlePublicLink(request: Request, env: Env) {
   try {
     upstream = await fetch(targetUrl.toString(), {
       method,
-      headers: buildUpstreamHeaders(request, targetUrl, baseUrl, slug),
+      headers: buildUpstreamHeaders(request, targetUrl, baseUrl, slug, method),
       redirect: 'manual',
       body: ['GET', 'HEAD'].includes(method) ? undefined : request.body,
     });
@@ -643,17 +643,20 @@ function ensureAbsolutePath(path: string): string {
   return path.startsWith('/') ? path : `/${path}`;
 }
 
-function buildUpstreamHeaders(request: Request, targetUrl: URL, baseUrl: URL, slug: string): Headers {
+const DEFAULT_ACCEPT_HEADER =
+  'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
+
+function buildUpstreamHeaders(request: Request, targetUrl: URL, baseUrl: URL, slug: string, method: string): Headers {
   const headers = new Headers();
   const forward = [
     'accept',
     'accept-language',
     'content-type',
     'cookie',
-    'sec-fetch-mode',
-    'sec-fetch-site',
-    'sec-fetch-dest',
     'user-agent',
+    'cache-control',
+    'pragma',
+    'upgrade-insecure-requests',
   ];
   request.headers.forEach((value, key) => {
     const lower = key.toLowerCase();
@@ -677,11 +680,21 @@ function buildUpstreamHeaders(request: Request, targetUrl: URL, baseUrl: URL, sl
   if (!headers.has('user-agent')) {
     headers.set('user-agent', MIRROR_USER_AGENT);
   }
-  if (!headers.has('accept')) {
-    headers.set('accept', '*/*');
-  }
-  if (!headers.has('accept-language')) {
-    headers.set('accept-language', 'en-US,en;q=0.9');
+  headers.set('accept', headers.get('accept') ?? DEFAULT_ACCEPT_HEADER);
+  headers.set('accept-language', headers.get('accept-language') ?? 'en-US,en;q=0.9');
+  const isNavigation = method === 'GET' || method === 'HEAD';
+  if (isNavigation) {
+    headers.set('upgrade-insecure-requests', '1');
+    headers.set('cache-control', 'max-age=0');
+    headers.set('pragma', 'no-cache');
+    headers.set('sec-fetch-site', 'none');
+    headers.set('sec-fetch-mode', 'navigate');
+    headers.set('sec-fetch-dest', 'document');
+  } else {
+    headers.delete('upgrade-insecure-requests');
+    headers.set('sec-fetch-site', 'same-origin');
+    headers.set('sec-fetch-mode', 'cors');
+    headers.set('sec-fetch-dest', 'empty');
   }
   headers.delete('accept-encoding');
   return headers;
